@@ -1,0 +1,554 @@
+import sqlite3
+import logging
+from datetime import datetime
+from config import Config
+
+logger = logging.getLogger(__name__)
+
+class Database:
+    def __init__(self):
+        """Инициализация базы данных"""
+        self.db_path = Config.DATABASE_PATH
+        self.init_database()
+    
+    def get_connection(self):
+        """Создание соединения с базой данных"""
+        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        return conn
+    
+    def init_database(self):
+        """Создание таблиц, если их нет"""
+        logger.info("Инициализация базы данных...")
+        
+        commands = [
+            # Таблица пользователей (ВАЖНО: должна быть первой!)
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                total_score INTEGER DEFAULT 0,
+                current_level INTEGER DEFAULT 1,
+                registration_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+                last_active DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            """,
+            
+            # Таблица попыток фишинга
+            """
+            CREATE TABLE IF NOT EXISTS phishing_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                example_id INTEGER NOT NULL,
+                user_answer TEXT NOT NULL,
+                is_correct BOOLEAN NOT NULL,
+                correct_type TEXT NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users (user_id)
+            )
+            """,
+            
+            # Таблица прогресса по модулям
+            """
+            CREATE TABLE IF NOT EXISTS user_progress (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                module_id INTEGER,
+                lesson_id INTEGER,
+                completed BOOLEAN DEFAULT 0,
+                score_earned INTEGER DEFAULT 0,
+                completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users (user_id)
+            )
+            """,
+            
+            # Таблица симуляций фишинга (для совместимости)
+            """
+            CREATE TABLE IF NOT EXISTS phishing_simulations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                simulation_id INTEGER,
+                user_answer TEXT,
+                correct_answer TEXT,
+                is_correct BOOLEAN,
+                earned_score INTEGER DEFAULT 0,
+                completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users (user_id)
+            )
+            """,
+            
+            # Таблица ежедневных заданий
+            """
+            CREATE TABLE IF NOT EXISTS daily_tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                task_date DATE,
+                completed BOOLEAN DEFAULT 0,
+                earned_score INTEGER DEFAULT 0,
+                FOREIGN KEY (user_id) REFERENCES users (user_id),
+                UNIQUE(user_id, task_date)
+            )
+            """,
+            
+            # Таблица рейтинга
+            """
+            CREATE TABLE IF NOT EXISTS leaderboard (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                total_score INTEGER DEFAULT 0,
+                current_level INTEGER DEFAULT 1,
+                last_update TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users (user_id)
+            )
+            """
+        ]
+        
+        conn = None
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            
+            for command in commands:
+                cursor.execute(command)
+            
+            conn.commit()
+            logger.info("✅ База данных успешно инициализирована")
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка при инициализации БД: {e}")
+        finally:
+            if conn:
+                conn.close()
+    
+    # ========== МЕТОДЫ ДЛЯ РАБОТЫ С ПОЛЬЗОВАТЕЛЯМИ ==========
+    
+    def add_or_update_user(self, user_id, username, first_name, last_name):
+        """Добавление или обновление пользователя"""
+        conn = None
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                INSERT OR REPLACE INTO users 
+                (user_id, username, first_name, last_name, last_active)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """, (user_id, username, first_name, last_name))
+            
+            conn.commit()
+            logger.info(f"✅ Пользователь добавлен/обновлен: {user_id}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка добавления пользователя {user_id}: {e}")
+            return False
+        finally:
+            if conn:
+                conn.close()
+    
+    def get_user(self, user_id):
+        """Получение информации о пользователе"""
+        conn = None
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+            user = cursor.fetchone()
+            
+            if user:
+                return dict(user)
+            return None
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения пользователя {user_id}: {e}")
+            return None
+        finally:
+            if conn:
+                conn.close()
+    
+    def update_user_score(self, user_id, score_to_add):
+        """Обновление счета пользователя"""
+        conn = None
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            
+            # Получаем текущий счет
+            cursor.execute("SELECT total_score FROM users WHERE user_id = ?", (user_id,))
+            result = cursor.fetchone()
+            
+            if result:
+                current_score = result[0] if result[0] else 0
+                new_score = current_score + score_to_add
+                
+                # Обновляем счет
+                cursor.execute("""
+                    UPDATE users 
+                    SET total_score = ?, last_active = CURRENT_TIMESTAMP
+                    WHERE user_id = ?
+                """, (new_score, user_id))
+                
+                # Обновляем уровень
+                self._update_user_level(user_id, new_score)
+                
+                # Обновляем рейтинг
+                self._update_leaderboard(user_id)
+                
+                conn.commit()
+                logger.info(f"✅ Счет пользователя {user_id} обновлен: +{score_to_add} (всего: {new_score})")
+                return new_score
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка обновления счета {user_id}: {e}")
+            return None
+        finally:
+            if conn:
+                conn.close()
+    
+    def _update_user_level(self, user_id, total_score):
+        """Обновление уровня пользователя на основе счета"""
+        conn = None
+        try:
+            # Определяем уровень по баллам
+            if total_score >= 1001:
+                level = 5  # Мастер
+            elif total_score >= 601:
+                level = 4  # Эксперт
+            elif total_score >= 301:
+                level = 3  # Знаток
+            elif total_score >= 101:
+                level = 2  # Ученик
+            else:
+                level = 1  # Новичок
+            
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                UPDATE users 
+                SET current_level = ? 
+                WHERE user_id = ?
+            """, (level, user_id))
+            
+            conn.commit()
+            return level
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка обновления уровня {user_id}: {e}")
+            return None
+        finally:
+            if conn:
+                conn.close()
+    
+    # ========== МЕТОДЫ ДЛЯ РАБОТЫ С МОДУЛЯМИ ==========
+    
+    def complete_lesson(self, user_id, module_id, lesson_id, earned_score):
+        """Отметка пройденного урока"""
+        conn = None
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            
+            # Проверяем, не пройден ли уже урок
+            cursor.execute("""
+                SELECT id FROM user_progress 
+                WHERE user_id = ? AND module_id = ? AND lesson_id = ?
+            """, (user_id, module_id, lesson_id))
+            
+            if cursor.fetchone():
+                logger.info(f"⚠️ Урок уже пройден: user={user_id}, module={module_id}, lesson={lesson_id}")
+                return False
+            
+            # Добавляем запись о прогрессе
+            cursor.execute("""
+                INSERT INTO user_progress 
+                (user_id, module_id, lesson_id, completed, score_earned)
+                VALUES (?, ?, ?, 1, ?)
+            """, (user_id, module_id, lesson_id, earned_score))
+            
+            # Обновляем общий счет пользователя
+            self.update_user_score(user_id, earned_score)
+            
+            conn.commit()
+            logger.info(f"✅ Урок отмечен как пройденный: user={user_id}, module={module_id}, lesson={lesson_id}, +{earned_score} баллов")
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка отметки урока: {e}")
+            return False
+        finally:
+            if conn:
+                conn.close()
+    
+    def get_user_progress(self, user_id, module_id=None):
+        """Получение прогресса пользователя"""
+        conn = None
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            
+            if module_id:
+                cursor.execute("""
+                    SELECT * FROM user_progress 
+                    WHERE user_id = ? AND module_id = ?
+                    ORDER BY lesson_id
+                """, (user_id, module_id))
+            else:
+                cursor.execute("""
+                    SELECT * FROM user_progress 
+                    WHERE user_id = ? 
+                    ORDER BY module_id, lesson_id
+                """, (user_id,))
+            
+            progress = cursor.fetchall()
+            return [dict(row) for row in progress]
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения прогресса {user_id}: {e}")
+            return []
+        finally:
+            if conn:
+                conn.close()
+    
+    # ========== МЕТОДЫ ДЛЯ ФИШИНГА ==========
+    
+    def get_user_shown_phishing_examples(self, user_id):
+        """Получение показанных пользователю примеров фишинга"""
+        conn = None
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                SELECT DISTINCT example_id 
+                FROM phishing_attempts 
+                WHERE user_id = ?
+            """, (user_id,))
+            
+            examples = cursor.fetchall()
+            return [row[0] for row in examples]  # Просто список ID
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения примеров фишинга: {e}")
+            return []
+        finally:
+            if conn:
+                conn.close()
+    
+    def save_phishing_attempt(self, user_id, example_id, user_answer, is_correct, correct_type):
+        """Сохранение попытки фишинга"""
+        conn = None
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                INSERT INTO phishing_attempts 
+                (user_id, example_id, user_answer, is_correct, correct_type)
+                VALUES (?, ?, ?, ?, ?)
+            """, (user_id, example_id, user_answer, is_correct, correct_type))
+            
+            conn.commit()
+            logger.info(f"✅ Сохранена попытка фишинга: user={user_id}, correct={is_correct}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка сохранения попытки фишинга: {e}")
+            return False
+        finally:
+            if conn:
+                conn.close()
+    
+    def get_phishing_stats(self, user_id):
+        """Получение статистики по фишингу"""
+        conn = None
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                SELECT 
+                    COUNT(*) as total_attempts,
+                    SUM(CASE WHEN is_correct = 1 THEN 1 ELSE 0 END) as correct_answers
+                FROM phishing_attempts 
+                WHERE user_id = ?
+            """, (user_id,))
+            
+            stats = cursor.fetchone()
+            
+            if stats and stats[0] > 0:
+                total_attempts = stats[0]
+                correct_answers = stats[1] if stats[1] else 0
+                accuracy = (correct_answers / total_attempts) * 100 if total_attempts > 0 else 0
+                
+                # Получаем общие баллы за фишинг
+                cursor.execute("""
+                    SELECT SUM(total_score) FROM users WHERE user_id = ?
+                """, (user_id,))
+                total_score_result = cursor.fetchone()
+                total_score = total_score_result[0] if total_score_result and total_score_result[0] else 0
+                
+                return {
+                    'total_attempts': total_attempts,
+                    'correct_answers': correct_answers,
+                    'accuracy': round(accuracy, 1),
+                    'total_score': total_score
+                }
+            
+            return {'total_attempts': 0, 'correct_answers': 0, 'accuracy': 0, 'total_score': 0}
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения статистики фишинга: {e}")
+            return {'total_attempts': 0, 'correct_answers': 0, 'accuracy': 0, 'total_score': 0}
+        finally:
+            if conn:
+                conn.close()
+    
+    # ========== МЕТОДЫ ДЛЯ РЕЙТИНГА ==========
+    
+    def _update_leaderboard(self, user_id):
+        """Обновление таблицы рейтинга"""
+        conn = None
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            
+            # Получаем данные пользователя
+            cursor.execute("""
+                SELECT u.user_id, u.username, u.total_score, u.current_level
+                FROM users u WHERE u.user_id = ?
+            """, (user_id,))
+            
+            user = cursor.fetchone()
+            
+            if user:
+                cursor.execute("""
+                    INSERT OR REPLACE INTO leaderboard 
+                    (user_id, username, total_score, current_level)
+                    VALUES (?, ?, ?, ?)
+                """, user)
+            
+            conn.commit()
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка обновления рейтинга: {e}")
+        finally:
+            if conn:
+                conn.close()
+    
+    def get_leaderboard(self, limit=10):
+        """Получение рейтинга пользователей"""
+        conn = None
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                SELECT user_id, username, total_score, current_level
+                FROM leaderboard 
+                ORDER BY total_score DESC
+                LIMIT ?
+            """, (limit,))
+            
+            leaderboard = cursor.fetchall()
+            return [dict(row) for row in leaderboard]
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения рейтинга: {e}")
+            return []
+        finally:
+            if conn:
+                conn.close()
+    
+    # ========== МЕТОДЫ ДЛЯ АДМИНИСТРАТОРА ==========
+    
+    def get_all_users(self):
+        """Получение всех пользователей (для админа)"""
+        conn = None
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                SELECT user_id, username, first_name, total_score, current_level, 
+                       registration_date, last_active
+                FROM users 
+                ORDER BY total_score DESC
+            """)
+            
+            users = cursor.fetchall()
+            return [dict(row) for row in users]
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения всех пользователей: {e}")
+            return []
+        finally:
+            if conn:
+                conn.close()
+    
+    def get_system_stats(self):
+        """Получение системной статистики"""
+        conn = None
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            
+            stats = {}
+            
+            # Количество пользователей
+            cursor.execute("SELECT COUNT(*) FROM users")
+            stats['total_users'] = cursor.fetchone()[0]
+            
+            # Общее количество баллов
+            cursor.execute("SELECT SUM(total_score) FROM users")
+            stats['total_scores'] = cursor.fetchone()[0] or 0
+            
+            # Пройденные уроки
+            cursor.execute("SELECT COUNT(*) FROM user_progress WHERE completed = 1")
+            stats['completed_lessons'] = cursor.fetchone()[0]
+            
+            # Попытки фишинга
+            cursor.execute("SELECT COUNT(*) FROM phishing_attempts")
+            stats['phishing_attempts'] = cursor.fetchone()[0]
+            
+            return stats
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения системной статистики: {e}")
+            return {}
+        finally:
+            if conn:
+                conn.close()
+
+# Глобальный объект базы данных
+db = Database()
+
+if __name__ == "__main__":
+    print("=" * 50)
+    print("ТЕСТИРОВАНИЕ БАЗЫ ДАННЫХ")
+    print("=" * 50)
+    
+    # Инициализация
+    db.init_database()
+    
+    # Тестовый пользователь
+    test_user_id = 123456
+    db.add_or_update_user(test_user_id, "test_user", "Тест", "Тестов")
+    
+    # Добавляем баллы
+    db.update_user_score(test_user_id, 100)
+    
+    # Получаем пользователя
+    user = db.get_user(test_user_id)
+    print(f"Тестовый пользователь: {user}")
+    
+    # Получаем рейтинг
+    leaderboard = db.get_leaderboard(5)
+    print(f"Рейтинг: {leaderboard}")
+    
+    print("=" * 50)

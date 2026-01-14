@@ -1,0 +1,131 @@
+"""
+СИСТЕМА НАЧИСЛЕНИЯ БАЛЛОВ И УРОВНЕЙ
+"""
+
+import logging
+from config import Config
+from database import db
+
+logger = logging.getLogger(__name__)
+
+class ScoringSystem:
+    def __init__(self):
+        pass
+    
+    def get_user_level_info(self, user_id):
+        """Получение информации об уровне пользователя"""
+        try:
+            user = db.get_user(user_id)
+            if not user:
+                return {'level': 1, 'level_name': 'Новичок'}
+            
+            total_score = user.get('total_score', 0)
+            
+            # Определяем уровень по баллам
+            for level_num, level_info in Config.USER_LEVELS.items():
+                min_score = level_info['min_score']
+                max_score = level_info['max_score']
+                
+                if max_score is None:  # Последний уровень без верхней границы
+                    if total_score >= min_score:
+                        return {'level': level_num, 'level_name': level_info['name']}
+                elif min_score <= total_score <= max_score:
+                    return {'level': level_num, 'level_name': level_info['name']}
+            
+            return {'level': 1, 'level_name': 'Новичок'}
+            
+        except Exception as e:
+            logger.error(f"Ошибка получения уровня пользователя {user_id}: {e}")
+            return {'level': 1, 'level_name': 'Новичок'}
+    
+    def get_progress_percentage(self, user_id):
+        """Получение прогресса до следующего уровня в процентах"""
+        try:
+            user = db.get_user(user_id)
+            if not user:
+                return 0
+            
+            total_score = user.get('total_score', 0)
+            current_level = user.get('current_level', 1)
+            
+            # Получаем информацию о текущем уровне
+            level_info = Config.USER_LEVELS.get(current_level, Config.USER_LEVELS[1])
+            
+            min_score = level_info['min_score']
+            max_score = level_info['max_score']
+            
+            if max_score is None:  # Если это последний уровень
+                return 100
+            
+            level_range = max_score - min_score
+            current_in_level = total_score - min_score
+            
+            if level_range <= 0:
+                return 0
+            
+            percentage = (current_in_level / level_range) * 100
+            return min(max(round(percentage, 1), 0), 100)
+            
+        except Exception as e:
+            logger.error(f"Ошибка расчета прогресса {user_id}: {e}")
+            return 0
+    
+    def add_score(self, user_id, score_to_add, reason=""):
+        """Добавление баллов пользователю"""
+        try:
+            # Обновляем счет пользователя
+            new_score = db.update_user_score(user_id, score_to_add)
+            
+            if new_score is not None:
+                logger.info(f"✅ Добавлено {score_to_add} баллов пользователю {user_id} за {reason}")
+                return new_score
+            
+            return None
+        except Exception as e:
+            logger.error(f"Ошибка добавления баллов {user_id}: {e}")
+            return None
+    
+    def add_score_for_test(self, user_id, score_type, module_id=None, lesson_id=None):
+        """Добавление баллов за тест"""
+        try:
+            score_amount = Config.SCORING_SYSTEM.get(score_type, 0)
+            
+            if score_amount <= 0:
+                return False
+            
+            # Обновляем счет пользователя
+            new_score = db.update_user_score(user_id, score_amount)
+            
+            if new_score is not None:
+                logger.info(f"✅ Добавлено {score_amount} баллов пользователю {user_id} за {score_type}")
+                return True
+            
+            return False
+            
+        except Exception as e:
+            logger.error(f"Ошибка добавления баллов {user_id}: {e}")
+            return False
+
+# Глобальный объект системы баллов
+scoring = ScoringSystem()
+
+if __name__ == "__main__":
+    print("=" * 50)
+    print("ТЕСТИРОВАНИЕ СИСТЕМЫ БАЛЛОВ")
+    print("=" * 50)
+    
+    # Тестируем уровень
+    from config import Config
+    
+    test_scores = [0, 50, 150, 400, 700, 1200]
+    for score in test_scores:
+        # Создаем тестового пользователя
+        test_id = 999000 + score
+        db.add_or_update_user(test_id, f"test_{score}", f"Тест{score}", "")
+        db.update_user_score(test_id, score)
+        
+        level_info = scoring.get_user_level_info(test_id)
+        progress = scoring.get_progress_percentage(test_id)
+        print(f"Баллы: {score:4d} -> Уровень: {level_info['level']} ({level_info['level_name']}), Прогресс: {progress}%")
+    
+    print("=" * 50)
